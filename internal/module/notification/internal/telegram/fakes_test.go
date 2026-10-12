@@ -90,6 +90,9 @@ type fakeRedisStore struct {
 	// deleted records the keys removed through Delete; a GetDel or Take
 	// consumes its key without a trace, like the Redis command.
 	deleted []string
+	// takes records the keys handed to Take, in call order, so a test can
+	// tell that a refused token never reached the store.
+	takes []string
 	// err fails every call when set, like Redis being unreachable.
 	err error
 }
@@ -111,6 +114,7 @@ func (s *fakeRedisStore) GetDel(ctx context.Context, key string) (string, error)
 }
 
 func (s *fakeRedisStore) Take(ctx context.Context, key string) (string, time.Duration, error) {
+	s.takes = append(s.takes, key)
 	value, err := s.Get(ctx, key)
 	if err != nil {
 		return "", 0, err

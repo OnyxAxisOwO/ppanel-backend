@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -258,6 +259,16 @@ func availabilityAt(s *usersub.SubscribeDetails, now time.Time) usersub.Availabi
 	return sub.AvailabilityAt(now)
 }
 
+// bindTokenPattern is the shape of an issued binding token: the 32 characters
+// of [A-Za-z0-9] that random.KeyNew(32, 1) draws when the panel issues the
+// deep link.
+var bindTokenPattern = regexp.MustCompile(`^[A-Za-z0-9]{32}$`)
+
+// isBindToken reports whether token has the shape of an issued binding token.
+func isBindToken(token string) bool {
+	return bindTokenPattern.MatchString(token)
+}
+
 // bindTokenKey addresses a single-use account-binding token. Binding tokens
 // live under their own prefix: the account's session id must never double as
 // a binding capability, because the deep link carrying it is shared through
@@ -266,9 +277,11 @@ func bindTokenKey(token string) string {
 	return fmt.Sprintf("%v:%v", config.TelegramBindKey, token)
 }
 
-// bindLockKey addresses the lock one account's bindings are made under.
+// bindLockKey addresses the lock one account's bindings are made under. It is
+// kept out of the token keyspace: every token key starts with
+// "<TelegramBindKey>:", which this key does not, so no token can name it.
 func bindLockKey(userID int64) string {
-	return fmt.Sprintf("%v:lock:%d", config.TelegramBindKey, userID)
+	return fmt.Sprintf("%v_lock:%d", config.TelegramBindKey, userID)
 }
 
 // bindLockTTL bounds the binding lock: long enough for the checks and the
@@ -279,30 +292,42 @@ const bindLockTTL = 10 * time.Second
 // bindFailed answers every bind failure the user cannot fix themselves.
 const bindFailed = "Bind failed. Please try again later."
 
+// bindTokenInvalid answers a token that is not an issued one, or has expired
+// or been redeemed already.
+const bindTokenInvalid = "Bind token is invalid or expired. Please request a new one."
+
 // bind redeems a single-use binding token issued by the panel, binding the
 // chat to the panel account it names. /start (the deep link) and /bind (the
 // manual command) differ only in the prompt for a missing token.
 //
-// The token is consumed before anything else, in one step: in webhook mode
-// updates are handled concurrently, so two chats opening the same forwarded
-// link at once must not both find the token. A redemption that then fails
-// for a reason the user can fix, or a failure of the stores, puts the token
-// back with the life it had left, so the user can retry without a new link
-// and nobody can keep a leaked link alive by failing on purpose. The
-// binding itself runs under a lock on the account, so two links of one
-// account redeemed at once cannot both pass the "not yet bound" check.
+// A token that does not have the shape of an issued one is refused before the
+// store is touched. The token is consumed before anything else, in one step:
+// in webhook mode updates are handled concurrently, so two chats opening the
+// same forwarded link at once must not both find the token. A redemption that
+// then fails for a reason the user can fix, or a failure of the stores, puts
+// the token back with the life it had left, so the user can retry without a
+// new link and nobody can keep a leaked link alive by failing on purpose. The
+// binding itself runs under a lock on the account, so two links of one account
+// redeemed at once cannot both pass the "not yet bound" check.
 func (b *Bot) bind(ctx context.Context, chatID int64, token, missingToken string) {
 	if token == "" {
 		b.send(ctx, chatID, missingToken)
 		return
 	}
 	log := logger.WithContext(ctx)
+	// Only the shape of an issued token is looked up. Whatever else the user
+	// typed is refused here, so the argument never chooses a key of the store.
+	if !isBindToken(token) {
+		log.Infow("[Telegram] bind: token is not in the issued format")
+		b.send(ctx, chatID, bindTokenInvalid)
+		return
+	}
 	key := bindTokenKey(token)
 	value, ttl, err := b.deps.Sessions.Take(ctx, key)
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			log.Infow("[Telegram] bind: token not found or expired")
-			b.send(ctx, chatID, "Bind token is invalid or expired. Please request a new one.")
+			b.send(ctx, chatID, bindTokenInvalid)
 			return
 		}
 		log.Errorw("[Telegram] bind: read token failed", logger.Field("error", err.Error()))

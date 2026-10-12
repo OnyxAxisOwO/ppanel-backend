@@ -22,25 +22,25 @@ import (
 // handled concurrently; the fake store consumes like GETDEL does.)
 func TestBindTokenIsConsumedBeforeBindingSoTwoChatsCannotBothRedeemIt(t *testing.T) {
 	logtest.Discard(t)
-	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey("shared"): "7"})
+	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey(testBindToken): "7"})
 	// The second chat's redemption runs while the first one's binding is
 	// being recorded: after the token was consumed, before the binding is
 	// visible.
 	second := ""
 	accounts.beforeBind = func() {
-		bot.HandleUpdate(context.Background(), privateUpdate(2002, "/start shared"))
+		bot.HandleUpdate(context.Background(), privateUpdate(2002, "/start "+testBindToken))
 		second = messenger.last().message
 	}
 
-	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start shared"))
+	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start "+testBindToken))
 
-	if second != "Bind token is invalid or expired. Please request a new one." {
+	if second != invalidBindToken {
 		t.Fatalf("second chat = %q, want the consumed token refused", second)
 	}
 	if len(accounts.bound) != 1 || accounts.bound[0].AuthIdentifier != "1001" {
 		t.Fatalf("bindings = %+v, want only the first chat bound", accounts.bound)
 	}
-	if _, present := store.values[bindKey("shared")]; present {
+	if _, present := store.values[bindKey(testBindToken)]; present {
 		t.Fatal("the redeemed token was put back")
 	}
 }
@@ -50,14 +50,14 @@ func TestBindTokenIsConsumedBeforeBindingSoTwoChatsCannotBothRedeemIt(t *testing
 // held, is refused with its token put back, and only one binding exists.
 func TestConcurrentRedemptionsOfOneAccountBindOnce(t *testing.T) {
 	logtest.Discard(t)
-	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey("first"): "7", bindKey("second"): "7"})
+	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey(testBindToken): "7", bindKey(testBindTokenSecond): "7"})
 	second := ""
 	accounts.beforeBind = func() {
-		bot.HandleUpdate(context.Background(), privateUpdate(2002, "/start second"))
+		bot.HandleUpdate(context.Background(), privateUpdate(2002, "/start "+testBindTokenSecond))
 		second = messenger.last().message
 	}
 
-	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start first"))
+	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start "+testBindToken))
 
 	if second != bindFailed {
 		t.Fatalf("second chat = %q, want it refused while the account's binding is in progress", second)
@@ -65,14 +65,14 @@ func TestConcurrentRedemptionsOfOneAccountBindOnce(t *testing.T) {
 	if len(accounts.bound) != 1 || accounts.bound[0].AuthIdentifier != "1001" {
 		t.Fatalf("bindings = %+v, want exactly one", accounts.bound)
 	}
-	if value, present := store.values[bindKey("second")]; !present || value != "7" || store.ttls[bindKey("second")] != fakeTokenTTL {
-		t.Fatalf("second token = %q (present %v, ttl %v), want it put back with its remaining life for a retry", value, present, store.ttls[bindKey("second")])
+	if value, present := store.values[bindKey(testBindTokenSecond)]; !present || value != "7" || store.ttls[bindKey(testBindTokenSecond)] != fakeTokenTTL {
+		t.Fatalf("second token = %q (present %v, ttl %v), want it put back with its remaining life for a retry", value, present, store.ttls[bindKey(testBindTokenSecond)])
 	}
 	if _, locked := store.values[bindLockKey(7)]; locked {
 		t.Fatal("the binding lock was not released")
 	}
 	// The retry, once the first redemption finished, sees the binding.
-	bot.HandleUpdate(context.Background(), privateUpdate(2002, "/start second"))
+	bot.HandleUpdate(context.Background(), privateUpdate(2002, "/start "+testBindTokenSecond))
 	if got := messenger.last().message; got != "Your account is already bound to a different Telegram account. Please unbind it first." {
 		t.Fatalf("retry = %q", got)
 	}
@@ -85,21 +85,21 @@ func TestConcurrentRedemptionsOfOneAccountBindOnce(t *testing.T) {
 // with its remaining life; the user retries without a new link.
 func TestBindRestoresTheTokenWhenTheStoreFails(t *testing.T) {
 	logtest.Discard(t)
-	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey("tok"): "7"})
-	store.ttls = map[string]time.Duration{bindKey("tok"): 90 * time.Second}
+	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey(testBindToken): "7"})
+	store.ttls = map[string]time.Duration{bindKey(testBindToken): 90 * time.Second}
 	accounts.err = errors.New("identity store down")
 
-	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start tok"))
+	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start "+testBindToken))
 
 	if got := messenger.last().message; got != bindFailed {
 		t.Fatalf("message = %q", got)
 	}
-	if value := store.values[bindKey("tok")]; value != "7" || store.ttls[bindKey("tok")] != 90*time.Second {
-		t.Fatalf("token = %q with ttl %v, want it restored with the 90s it had left", value, store.ttls[bindKey("tok")])
+	if value := store.values[bindKey(testBindToken)]; value != "7" || store.ttls[bindKey(testBindToken)] != 90*time.Second {
+		t.Fatalf("token = %q with ttl %v, want it restored with the 90s it had left", value, store.ttls[bindKey(testBindToken)])
 	}
 	// Once the store is back the same link binds.
 	accounts.err = nil
-	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start tok"))
+	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start "+testBindToken))
 	if len(accounts.bound) != 1 {
 		t.Fatalf("bindings = %+v, want the retried link redeemed", accounts.bound)
 	}
@@ -109,9 +109,9 @@ func TestBindRestoresTheTokenWhenTheStoreFails(t *testing.T) {
 // the account.
 func TestBindFailsClosedWithoutTheTokenStore(t *testing.T) {
 	logtest.Discard(t)
-	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey("tok"): "7"})
+	bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey(testBindToken): "7"})
 	store.err = errors.New("redis down")
-	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start tok"))
+	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start "+testBindToken))
 	if got := messenger.last().message; got != bindFailed || len(accounts.bound) != 0 {
 		t.Fatalf("message = %q, bindings = %+v", got, accounts.bound)
 	}

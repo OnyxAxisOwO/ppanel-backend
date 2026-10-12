@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/perfect-panel/server/internal/config"
+	"github.com/perfect-panel/server/pkg/random"
 )
 
 func newBindHarness(tokens map[string]string) (*Bot, *fakeRedisStore, *fakeAccounts, *recordingMessenger) {
@@ -25,12 +26,21 @@ func bindKey(token string) string {
 	return fmt.Sprintf("%v:%v", config.TelegramBindKey, token)
 }
 
+// Tokens of the issued shape: 32 characters of [A-Za-z0-9], as
+// random.KeyNew(32, 1) draws them.
+const (
+	testBindToken       = "hxjh99bESRm7ap4CJrYa4UFA9MScIEDo"
+	testBindTokenSecond = "rq9oHyHGqvy8ngrSkGfBupq0pW5NgtMF"
+)
+
+const invalidBindToken = "Bind token is invalid or expired. Please request a new one."
+
 // A session id must no longer work as a bind token: the deep link travels
 // through Telegram chats, and accepting session ids let whoever saw one bind
 // their own Telegram account — and therefore log in — as that user.
 func TestBindRejectsSessionIdAsToken(t *testing.T) {
 	for _, command := range []string{"/bind", "/start"} {
-		token := "leaked-session-id"
+		token := testBindToken
 		bot, _, accounts, messenger := newBindHarness(map[string]string{
 			fmt.Sprintf("%v:%v", config.SessionIdKey, token): "7",
 		})
@@ -40,7 +50,7 @@ func TestBindRejectsSessionIdAsToken(t *testing.T) {
 		if len(accounts.bound) != 0 {
 			t.Fatalf("%s: session id was accepted as a bind token: %+v", command, accounts.bound[0])
 		}
-		if got := messenger.last().message; got != "Bind token is invalid or expired. Please request a new one." {
+		if got := messenger.last().message; got != invalidBindToken {
 			t.Fatalf("%s: message = %q", command, got)
 		}
 	}
@@ -52,7 +62,7 @@ func TestBindRejectsSessionIdAsToken(t *testing.T) {
 func TestBindConsumesDedicatedTokenExactlyOnce(t *testing.T) {
 	for _, command := range []string{"/bind", "/start"} {
 		t.Run(command, func(t *testing.T) {
-			token := "bind-token"
+			token := testBindToken
 			bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey(token): "7"})
 
 			bot.HandleUpdate(context.Background(), privateUpdate(1001, command+" "+token))
@@ -79,7 +89,7 @@ func TestBindConsumesDedicatedTokenExactlyOnce(t *testing.T) {
 			if len(accounts.bound) != 1 {
 				t.Fatal("a consumed bind token was accepted again")
 			}
-			if got := messenger.last().message; got != "Bind token is invalid or expired. Please request a new one." {
+			if got := messenger.last().message; got != invalidBindToken {
 				t.Fatalf("message = %q", got)
 			}
 		})
@@ -126,10 +136,10 @@ func TestBindKeepsExistingBindings(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey("tok"): "7"})
+			bot, store, accounts, messenger := newBindHarness(map[string]string{bindKey(testBindToken): "7"})
 			tt.seed(accounts)
 
-			bot.HandleUpdate(context.Background(), privateUpdate(1001, "/bind tok"))
+			bot.HandleUpdate(context.Background(), privateUpdate(1001, "/bind "+testBindToken))
 
 			if len(accounts.bound) != 0 {
 				t.Fatalf("binding written: %+v", accounts.bound)
@@ -137,9 +147,9 @@ func TestBindKeepsExistingBindings(t *testing.T) {
 			if got := messenger.last().message; got != tt.want {
 				t.Fatalf("message = %q, want %q", got, tt.want)
 			}
-			value, present := store.values[bindKey("tok")]
-			if present != tt.restored || (present && (value != "7" || store.ttls[bindKey("tok")] != fakeTokenTTL)) {
-				t.Fatalf("token stored = %v (%q, ttl %v), want restored %v with its remaining life", present, value, store.ttls[bindKey("tok")], tt.restored)
+			value, present := store.values[bindKey(testBindToken)]
+			if present != tt.restored || (present && (value != "7" || store.ttls[bindKey(testBindToken)] != fakeTokenTTL)) {
+				t.Fatalf("token stored = %v (%q, ttl %v), want restored %v with its remaining life", present, value, store.ttls[bindKey(testBindToken)], tt.restored)
 			}
 			if _, locked := store.values[bindLockKey(7)]; locked {
 				t.Fatal("the binding lock was not released")
@@ -149,9 +159,91 @@ func TestBindKeepsExistingBindings(t *testing.T) {
 }
 
 func TestBindRejectsMalformedTokenValue(t *testing.T) {
-	bot, _, accounts, messenger := newBindHarness(map[string]string{bindKey("tok"): "not-a-user"})
-	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start tok"))
+	bot, _, accounts, messenger := newBindHarness(map[string]string{bindKey(testBindToken): "not-a-user"})
+	bot.HandleUpdate(context.Background(), privateUpdate(1001, "/start "+testBindToken))
 	if len(accounts.bound) != 0 || !strings.Contains(messenger.last().message, "Invalid session data") {
 		t.Fatalf("bound = %+v, message = %q", accounts.bound, messenger.last().message)
+	}
+}
+
+// A /bind or /start argument that is not a token of the issued shape is
+// refused before the store is asked for it. The argument used to be the
+// store key itself: "lock:<id>" addressed the binding lock of that account,
+// and redeeming it consumed the lock and bound the chat to the user the
+// lock's value named. Every argument here is sent while the locks of
+// accounts 1 and 7 are held, and none may reach the store.
+func TestBindRefusesMalformedTokensBeforeTheStore(t *testing.T) {
+	for _, arg := range []string{
+		"lock:1",
+		"lock:7",
+		"lock:",
+		"leaked-session-id",
+		strings.Repeat("a", 31),
+		strings.Repeat("a", 33),
+		testBindToken[:31] + "_",
+		testBindToken[:31] + ":",
+		" " + testBindToken,
+		testBindToken + " ",
+		testBindToken + "\n",
+	} {
+		for _, command := range []string{"/bind", "/start"} {
+			bot, store, accounts, messenger := newBindHarness(map[string]string{
+				bindLockKey(1):         "1",
+				bindLockKey(7):         "1",
+				bindKey(testBindToken): "7",
+			})
+
+			bot.HandleUpdate(context.Background(), privateUpdate(1001, command+" "+arg))
+
+			if got := messenger.last().message; got != invalidBindToken {
+				t.Fatalf("%s %q: message = %q, want the invalid token refusal", command, arg, got)
+			}
+			if len(accounts.bound) != 0 {
+				t.Fatalf("%s %q: chat bound: %+v", command, arg, accounts.bound)
+			}
+			if len(store.takes) != 0 || len(store.deleted) != 0 {
+				t.Fatalf("%s %q: store asked for the token (takes %v) or keys released (deleted %v)", command, arg, store.takes, store.deleted)
+			}
+			if len(store.values) != 3 || store.values[bindLockKey(1)] != "1" || store.values[bindLockKey(7)] != "1" || store.values[bindKey(testBindToken)] != "7" {
+				t.Fatalf("%s %q: store changed to %v", command, arg, store.values)
+			}
+		}
+	}
+}
+
+// The binding lock of an account lives outside the token keyspace, so no
+// token can address it, whatever its spelling.
+func TestBindLockKeyLivesOutsideTheTokenKeyspace(t *testing.T) {
+	for _, userID := range []int64{1, 7, 1 << 40} {
+		if strings.HasPrefix(bindLockKey(userID), config.TelegramBindKey+":") {
+			t.Fatalf("bindLockKey(%d) = %q is in the token keyspace", userID, bindLockKey(userID))
+		}
+	}
+}
+
+// isBindToken accepts exactly the shape that random.KeyNew(32, 1) issues.
+func TestIsBindTokenAcceptsOnlyTheIssuedShape(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		if token := random.KeyNew(32, 1); !isBindToken(token) {
+			t.Fatalf("issued token %q is refused", token)
+		}
+	}
+	for _, token := range []string{
+		"",
+		"1",
+		"lock:1",
+		"lock:7",
+		strings.Repeat("a", 31),
+		strings.Repeat("a", 33),
+		testBindToken[:31] + "_",
+		testBindToken[:31] + ":",
+		testBindToken[:31] + "-",
+		testBindToken[:31] + " ",
+		"\n" + testBindToken[:31],
+		strings.Repeat("é", 16),
+	} {
+		if isBindToken(token) {
+			t.Fatalf("isBindToken(%q) = true", token)
+		}
 	}
 }
