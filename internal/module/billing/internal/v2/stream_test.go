@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/perfect-panel/server/internal/auth/token"
 	dto "github.com/perfect-panel/server/internal/module/billing/contract"
 	"github.com/perfect-panel/server/internal/module/billing/entity/order"
 	"github.com/perfect-panel/server/pkg/xerr"
+	"github.com/redis/go-redis/v9"
 )
 
 // streamOrder is a user's pending order and the ticket that streams it.
@@ -308,13 +310,13 @@ func TestStreamSubscriptionLifecycle(t *testing.T) {
 	}
 }
 
-// One ticket holds a bounded number of concurrent streams; a refused stream
+// One order holds a bounded number of concurrent streams; a refused stream
 // receives nothing.
-func TestStreamRefusesTooManyStreamsPerTicket(t *testing.T) {
+func TestStreamRefusesTooManyStreamsPerOrder(t *testing.T) {
 	f := newV2Fixture(t, v2Options{})
 	o := f.streamOrder()
 	var streams []*runningStream
-	for range maxStreamsPerTicket {
+	for range maxStreamsPerOrder {
 		sink := newCollectingSink()
 		streams = append(streams, f.openStream(o.ctx, StreamRequest{OrderNo: o.orderNo, Ticket: o.ticket}, sink))
 		sink.waitFor(t, 1)
@@ -327,6 +329,160 @@ func TestStreamRefusesTooManyStreamsPerTicket(t *testing.T) {
 	admitted := newCollectingSink()
 	f.openStream(o.ctx, StreamRequest{OrderNo: o.orderNo, Ticket: o.ticket}, admitted)
 	admitted.waitFor(t, 1)
+}
+
+// The slots belong to the order, not to a ticket: re-minting a ticket of the
+// same order gives the same claims at a later issue time, another string,
+// and it must draw on the slots the order already holds. Another order keeps
+// its own slots.
+func TestStreamSlotsAreSharedByTheTicketsOfOneOrder(t *testing.T) {
+	f := newV2Fixture(t, v2Options{})
+	o := f.streamOrder()
+	reissued, err := token.NewJwtToken("v2-secret", time.Now().Unix()+1, 600,
+		token.WithOption("OrderNo", o.orderNo), token.WithOption("Scope", v2EventScope), token.WithOption("UserId", f.h.ReloadOrder(o.orderNo).UserId))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reissued == o.ticket {
+		t.Fatal("the reissued ticket must be a different ticket")
+	}
+
+	tickets := []string{o.ticket, reissued}
+	var streams []*runningStream
+	for i := range maxStreamsPerOrder {
+		sink := newCollectingSink()
+		streams = append(streams, f.openStream(o.ctx, StreamRequest{OrderNo: o.orderNo, Ticket: tickets[i%len(tickets)]}, sink))
+		sink.waitFor(t, 1)
+	}
+	// Were the reissued ticket to open a fresh bucket, the stream would run
+	// until this deadline instead of being refused.
+	deadline, cancel := context.WithTimeout(o.ctx, 2*time.Second)
+	defer cancel()
+	refused := newCollectingSink()
+	if err := f.svc.StreamEvents(deadline, StreamRequest{OrderNo: o.orderNo, Ticket: reissued}, refused); !errors.Is(err, ErrTooManyStreams) || len(refused.snapshot()) != 0 {
+		t.Fatalf("StreamEvents = %v with %v, want ErrTooManyStreams: a new ticket opened a fresh bucket", err, refused.names())
+	}
+
+	other := f.streamOrder()
+	otherSink := newCollectingSink()
+	f.openStream(other.ctx, StreamRequest{OrderNo: other.orderNo, Ticket: other.ticket}, otherSink)
+	otherSink.waitFor(t, 1)
+
+	// A released slot admits the reissued ticket.
+	_ = streams[0].stop()
+	admitted := newCollectingSink()
+	f.openStream(o.ctx, StreamRequest{OrderNo: o.orderNo, Ticket: reissued}, admitted)
+	admitted.waitFor(t, 1)
+}
+
+// The counter of an order lasts as long as its latest stream: a stream that
+// starts later, on a ticket that expires later, extends its expiry, so the
+// counter cannot reset while that stream is still open.
+func TestRedisLimiterCounterOutlivesTheLatestStream(t *testing.T) {
+	f := newV2Fixture(t, v2Options{})
+	limiter := RedisLimiter{Client: f.h.Redis}
+	ctx := context.Background()
+	first, ok := limiter.Acquire(ctx, "order-ttl", time.Minute)
+	if !ok {
+		t.Fatal("the first stream was refused")
+	}
+	defer first()
+	latest, ok := limiter.Acquire(ctx, "order-ttl", 30*time.Minute)
+	if !ok {
+		t.Fatal("the second stream was refused")
+	}
+	defer latest()
+	ttl, err := f.h.Redis.TTL(ctx, "order:sse:connections:order-ttl").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl < 20*time.Minute {
+		t.Fatalf("the counter expires in %v, want it to last for the latest stream's 30m", ttl)
+	}
+}
+
+// limiterRedis serves a Redis of the test's own, whose clock the test moves.
+func limiterRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
+	t.Helper()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { _ = client.Close() })
+	return server, client
+}
+
+// The expiry of an order's counter never shortens: a stream that starts on a
+// shorter ticket leaves the expiry of an open longer stream in place, so the
+// counter outlives that stream whichever of the order's tickets came first.
+func TestRedisLimiterExpiryNeverShortens(t *testing.T) {
+	server, client := limiterRedis(t)
+	limiter := RedisLimiter{Client: client}
+	ctx := context.Background()
+	long, ok := limiter.Acquire(ctx, "order-shrink", 9*time.Minute)
+	if !ok {
+		t.Fatal("the long stream was refused")
+	}
+	defer long()
+	short, ok := limiter.Acquire(ctx, "order-shrink", 5*time.Minute)
+	if !ok {
+		t.Fatal("the short stream was refused")
+	}
+	short()
+	server.FastForward(6 * time.Minute)
+	if n, err := client.Get(ctx, "order:sse:connections:order-shrink").Int(); err != nil || n != 1 {
+		t.Fatalf("the counter = %d (%v) after six minutes, want the open long stream still counted", n, err)
+	}
+}
+
+// A refused attempt changes neither the count nor the expiry of the counter,
+// so a refused attempt on a shorter ticket cannot shorten the expiry of the
+// streams it was refused against.
+func TestRedisLimiterRefusedStreamKeepsTheExpiry(t *testing.T) {
+	server, client := limiterRedis(t)
+	limiter := RedisLimiter{Client: client}
+	ctx := context.Background()
+	for range maxStreamsPerOrder {
+		if _, ok := limiter.Acquire(ctx, "order-refused", 9*time.Minute); !ok {
+			t.Fatal("a stream within the cap was refused")
+		}
+	}
+	if _, ok := limiter.Acquire(ctx, "order-refused", time.Minute); ok {
+		t.Fatal("a stream beyond the cap was admitted")
+	}
+	server.FastForward(2 * time.Minute)
+	if n, err := client.Get(ctx, "order:sse:connections:order-refused").Int(); err != nil || n != maxStreamsPerOrder {
+		t.Fatalf("the counter = %d (%v) after a refused attempt, want the %d open streams still counted", n, err, maxStreamsPerOrder)
+	}
+}
+
+// A stream that ends at its ticket's expiry returns its slot while the
+// counter still exists: the counter never goes below zero, and once it
+// expires the order gets its full cap again.
+func TestRedisLimiterCounterSurvivesAStreamEndingAtItsExpiry(t *testing.T) {
+	server, client := limiterRedis(t)
+	limiter := RedisLimiter{Client: client}
+	ctx := context.Background()
+	// The expiry keeps its milliseconds: a whole-second truncation would
+	// expire the counter before the stream it counts ends.
+	ttl := 5*time.Minute + 500*time.Millisecond
+	release, ok := limiter.Acquire(ctx, "order-drift", ttl)
+	if !ok {
+		t.Fatal("the stream was refused")
+	}
+	server.FastForward(ttl)
+	release()
+	if n, err := client.Get(ctx, "order:sse:connections:order-drift").Int(); err != nil || n != 0 {
+		t.Fatalf("the counter = %d (%v) after the stream ended, want 0", n, err)
+	}
+
+	server.FastForward(2 * time.Minute)
+	for range maxStreamsPerOrder {
+		if _, ok := limiter.Acquire(ctx, "order-drift", time.Minute); !ok {
+			t.Fatal("a stream within the cap was refused after the counter expired")
+		}
+	}
+	if _, ok := limiter.Acquire(ctx, "order-drift", time.Minute); ok {
+		t.Fatal("a stream beyond the cap was admitted after the counter expired")
+	}
 }
 
 // A stream ends with a notice when its ticket expires; the client fetches a

@@ -108,7 +108,7 @@ type Service interface {
 	// ends or the ticket expires: the snapshot, the events after the replay
 	// cursor, then live events. It returns an error only when the stream is
 	// refused, before anything reached the sink (ErrTooManyEventStreams
-	// when the ticket holds its maximum of concurrent streams).
+	// when the order holds its maximum of concurrent streams).
 	V2StreamOrderEvents(ctx context.Context, req V2EventStreamRequest, sink V2EventSink) error
 
 	// PublishOrderEvents drains the order-event outbox the streams replay:
@@ -201,7 +201,7 @@ type (
 // distinct transport condition: the original order remains intact.
 var ErrIdempotencyKeyReused = v2orch.ErrIdempotencyKeyReused
 
-// ErrTooManyEventStreams refuses an order event stream whose ticket already
+// ErrTooManyEventStreams refuses an order event stream whose order already
 // holds its maximum of concurrent streams.
 var ErrTooManyEventStreams = v2orch.ErrTooManyStreams
 

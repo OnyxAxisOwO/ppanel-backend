@@ -2,8 +2,6 @@ package v2
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -15,12 +13,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ErrTooManyStreams reports that the ticket already holds the maximum number
+// ErrTooManyStreams reports that the order already holds the maximum number
 // of concurrent event streams.
 var ErrTooManyStreams = errors.New("too many concurrent event streams")
 
-// maxStreamsPerTicket caps the concurrent streams one ticket may hold.
-const maxStreamsPerTicket = 3
+// maxStreamsPerOrder caps the concurrent streams one order may hold, across
+// all the tickets that stream it.
+const maxStreamsPerOrder = 3
 
 // replayBatch is how many events one replay query reads.
 const replayBatch = 500
@@ -50,11 +49,11 @@ type Broker interface {
 	Subscribe(ctx context.Context, orderNo string) (Subscription, error)
 }
 
-// StreamLimiter bounds the concurrent streams of one ticket.
+// StreamLimiter bounds the concurrent streams of one order.
 type StreamLimiter interface {
-	// Acquire takes one of the ticket's stream slots for at most ttl and
+	// Acquire takes one of the order's stream slots for at most ttl and
 	// returns its release.
-	Acquire(ctx context.Context, ticket string, ttl time.Duration) (release func(), ok bool)
+	Acquire(ctx context.Context, orderNo string, ttl time.Duration) (release func(), ok bool)
 }
 
 // StreamTiming paces a stream; zero values select the production pacing.
@@ -94,7 +93,7 @@ func (s *Service) StreamEvents(ctx context.Context, req StreamRequest, sink Even
 		return err
 	}
 	if limiter := s.deps.Stream.Limiter; limiter != nil {
-		release, ok := limiter.Acquire(ctx, req.Ticket, time.Until(expiresAt))
+		release, ok := limiter.Acquire(ctx, req.OrderNo, time.Until(expiresAt))
 		if !ok {
 			return ErrTooManyStreams
 		}
@@ -298,34 +297,60 @@ func (s *redisSubscription) Wake() <-chan struct{} { return s.wake }
 
 func (s *redisSubscription) Close() error { return s.pubsub.Close() }
 
-// RedisLimiter counts a ticket's streams in Redis. During a Redis outage
-// every stream is admitted: the event table can still sustain it, and the
-// cap is a best-effort abuse control, not a reason to hide a paid order from
-// its owner.
+// RedisLimiter counts an order's streams in Redis, across all of its tickets:
+// a re-minted ticket draws on the same slots. During a Redis outage every
+// stream is admitted: the event table can still sustain it, and the cap is a
+// best-effort abuse control, not a reason to hide a paid order from its owner.
 type RedisLimiter struct {
 	Client *redis.Client
 }
 
-func (l RedisLimiter) Acquire(ctx context.Context, ticket string, ttl time.Duration) (func(), bool) {
+// streamCounterGrace keeps an order's counter a minute past the expiry of the
+// stream that expires last, so the counter outlives every stream it counts.
+const streamCounterGrace = time.Minute
+
+// acquireStreamSlot admits a stream while the order holds fewer than the
+// maximum. The expiry only ever grows to cover the stream, so a stream on a
+// shorter ticket never shortens the expiry of an open one, and a refused
+// attempt changes nothing.
+var acquireStreamSlot = redis.NewScript(`
+if tonumber(redis.call("GET", KEYS[1]) or "0") >= tonumber(ARGV[1]) then
+  return 0
+end
+redis.call("INCR", KEYS[1])
+if redis.call("PTTL", KEYS[1]) < tonumber(ARGV[2]) then
+  redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 1
+`)
+
+// releaseStreamSlot returns a slot. It creates no counter and never takes one
+// below zero, so a release that finds the counter gone leaves nothing behind.
+var releaseStreamSlot = redis.NewScript(`
+if tonumber(redis.call("GET", KEYS[1]) or "0") > 0 then
+  return redis.call("DECR", KEYS[1])
+end
+return 0
+`)
+
+func (l RedisLimiter) Acquire(ctx context.Context, orderNo string, ttl time.Duration) (func(), bool) {
 	if l.Client == nil {
 		return func() {}, true
 	}
-	digest := sha256.Sum256([]byte(ticket))
-	key := "order:sse:connections:" + hex.EncodeToString(digest[:])
-	count, err := l.Client.Incr(ctx, key).Result()
+	key := "order:sse:connections:" + orderNo
+	// PEXPIRE takes milliseconds: go-redis's Expire truncates to whole seconds,
+	// which would expire the counter before the stream it counts ends.
+	expiry := ttl + streamCounterGrace
+	admitted, err := acquireStreamSlot.Run(ctx, l.Client, []string{key}, maxStreamsPerOrder, expiry.Milliseconds()).Int()
 	if err != nil {
 		return func() {}, true
 	}
-	if count == 1 {
-		_ = l.Client.Expire(ctx, key, max(ttl, time.Minute)).Err()
-	}
-	if count > maxStreamsPerTicket {
-		_, _ = l.Client.Decr(ctx, key).Result()
+	if admitted == 0 {
 		return func() {}, false
 	}
 	return func() {
 		// The release runs when the stream ends, usually because the client
 		// went away and cancelled ctx; the slot must be returned anyway.
-		_, _ = l.Client.Decr(context.WithoutCancel(ctx), key).Result()
+		_ = releaseStreamSlot.Run(context.WithoutCancel(ctx), l.Client, []string{key}).Err()
 	}, true
 }
