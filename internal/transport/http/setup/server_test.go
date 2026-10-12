@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server/render"
 	"github.com/perfect-panel/server/internal/config"
 	"github.com/perfect-panel/server/pkg/logger/logtest"
@@ -173,14 +174,29 @@ type initResponse struct {
 	Status bool   `json:"status"`
 }
 
-// submit posts the installer's form and returns the HTTP status and body.
+// submit posts the installer's form the way the page does: from the wizard's
+// own origin, as JSON.
 func (inst *installation) submit(t *testing.T, body string) (int, initResponse) {
+	t.Helper()
+	return inst.post(t, "/init/config", "127.0.0.1:8080", "http://127.0.0.1:8080", "application/json", body)
+}
+
+// post sends body to path with the given Host, Origin and Content-Type and
+// returns the HTTP status and body. An empty Origin or Content-Type is left
+// out of the request.
+func (inst *installation) post(t *testing.T, path, host, origin, contentType, body string) (int, initResponse) {
 	t.Helper()
 	engine := newConfigServer(inst.wizard)
 	ctx := engine.NewContext()
-	ctx.Request.SetRequestURI("/init/config")
+	ctx.Request.SetRequestURI(path)
 	ctx.Request.Header.SetMethod(http.MethodPost)
-	ctx.Request.Header.SetContentTypeBytes([]byte("application/json"))
+	ctx.Request.Header.SetHost(host)
+	if origin != "" {
+		ctx.Request.Header.Set("Origin", origin)
+	}
+	if contentType != "" {
+		ctx.Request.Header.SetContentTypeBytes([]byte(contentType))
+	}
 	ctx.Request.SetBody([]byte(body))
 	engine.ServeHTTP(context.Background(), ctx)
 	var response initResponse
@@ -188,6 +204,124 @@ func (inst *installation) submit(t *testing.T, body string) (int, initResponse) 
 		t.Fatalf("response %q: %v", ctx.Response.Body(), err)
 	}
 	return ctx.Response.StatusCode(), response
+}
+
+// A state-changing request that is not the wizard's own page is refused with
+// 403 before the handler runs: a cross-site form (text/plain), a cross-origin
+// fetch, a DNS-rebinding host and a look-alike host, an Origin on another
+// port than the Host, a null origin, and a request without a JSON type.
+// Nothing is written and the wizard stays unclaimed.
+func TestSetupGuardRefusesRequestsThatAreNotTheWizardsPage(t *testing.T) {
+	logtest.Discard(t)
+	for name, tc := range map[string]struct {
+		host, origin, contentType string
+	}{
+		"text/plain form from another site": {"127.0.0.1:8080", "http://evil.example", "text/plain"},
+		"text/plain form without origin":    {"127.0.0.1:8080", "", "text/plain"},
+		"json from another origin":          {"127.0.0.1:8080", "http://evil.example", "application/json"},
+		"dns rebinding host":                {"evil.example:8080", "http://evil.example:8080", "application/json"},
+		"loopback look-alike host":          {"localhost.evil.example:8080", "http://localhost.evil.example:8080", "application/json"},
+		"origin on another port":            {"localhost:9000", "http://localhost:8080", "application/json"},
+		"null origin":                       {"127.0.0.1:8080", "null", "application/json"},
+		"https origin":                      {"127.0.0.1:8080", "https://127.0.0.1:8080", "application/json"},
+		"no content type":                   {"127.0.0.1:8080", "http://127.0.0.1:8080", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inst := newInstallation(t)
+			before, _ := os.ReadFile(inst.configPath)
+
+			status, response := inst.post(t, "/init/config", tc.host, tc.origin, tc.contentType, validForm)
+
+			if status != http.StatusForbidden {
+				t.Fatalf("submit = %d %+v, want 403", status, response)
+			}
+			if after, _ := os.ReadFile(inst.configPath); string(after) != string(before) {
+				t.Fatal("the configuration file was written for a refused request")
+			}
+			if inst.migrations != 0 || len(inst.admins) != 0 {
+				t.Fatal("the database was touched by a refused request")
+			}
+			if !inst.begin() {
+				t.Fatal("a refused request claimed the wizard")
+			}
+		})
+	}
+}
+
+// The page's own posts pass the guard: a same-origin JSON body on a loopback
+// name, on any port, with or without a port (a browser on port 80 omits it),
+// with or without a charset parameter, and a script's post that sends no
+// Origin. A tunnel from another local port reaches the wizard the same way.
+func TestSetupGuardPassesTheWizardsOwnPage(t *testing.T) {
+	logtest.Discard(t)
+	for name, tc := range map[string]struct {
+		host, origin, contentType string
+	}{
+		"loopback address":                 {"127.0.0.1:8080", "http://127.0.0.1:8080", "application/json"},
+		"localhost":                        {"localhost:8080", "http://localhost:8080", "application/json"},
+		"ssh tunnel on another local port": {"localhost:9000", "http://localhost:9000", "application/json"},
+		"loopback address on another port": {"127.0.0.1:9000", "http://127.0.0.1:9000", "application/json"},
+		"loopback address without a port":  {"127.0.0.1", "http://127.0.0.1", "application/json"},
+		"localhost without a port":         {"localhost", "http://localhost", "application/json"},
+		"ipv6 loopback":                    {"[::1]:9000", "http://[::1]:9000", "application/json"},
+		"ipv6 loopback without a port":     {"[::1]", "http://[::1]", "application/json"},
+		"charset parameter":                {"127.0.0.1:8080", "http://127.0.0.1:8080", "application/json; charset=utf-8"},
+		"no origin, as a script posts":     {"127.0.0.1:8080", "", "application/json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inst := newInstallation(t)
+
+			status, response := inst.post(t, "/init/config", tc.host, tc.origin, tc.contentType, validForm)
+
+			if status != http.StatusOK || !response.Status {
+				t.Fatalf("submit = %d %+v, want the request to pass the guard and install", status, response)
+			}
+			if inst.migrations != 1 {
+				t.Fatalf("migrations = %d, want 1", inst.migrations)
+			}
+		})
+	}
+}
+
+// The handlers check the body type too, so a handler reached without the
+// guard still refuses a text/plain body as an invalid request before it
+// connects to anything or writes the file, even when the body is valid JSON.
+func TestSetupHandlersRefuseNonJSONBodies(t *testing.T) {
+	logtest.Discard(t)
+	inst := newInstallation(t)
+	before, _ := os.ReadFile(inst.configPath)
+	for name, tc := range map[string]struct {
+		handler func(context.Context, *app.RequestContext)
+		body    string
+	}{
+		"config":   {inst.wizard.handleInitConfig, validForm},
+		"database": {HandleDatabaseTest, `{"driver":"mysql","host":"127.0.0.1","port":"1","database":"ppanel","user":"root","password":"x"}`},
+		"redis":    {HandleRedisTest, `{"host":"127.0.0.1","port":"1","password":""}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := newConfigServer(inst.wizard).NewContext()
+			ctx.Request.SetRequestURI("/")
+			ctx.Request.Header.SetMethod(http.MethodPost)
+			ctx.Request.Header.SetContentTypeBytes([]byte("text/plain"))
+			ctx.Request.SetBody([]byte(tc.body))
+
+			tc.handler(context.Background(), ctx)
+
+			var response initResponse
+			if err := json.Unmarshal(ctx.Response.Body(), &response); err != nil {
+				t.Fatalf("response %q: %v", ctx.Response.Body(), err)
+			}
+			if ctx.Response.StatusCode() != http.StatusBadRequest || response.Msg != "Invalid request" {
+				t.Fatalf("handler = %d %+v, want 400 Invalid request", ctx.Response.StatusCode(), response)
+			}
+		})
+	}
+	if after, _ := os.ReadFile(inst.configPath); string(after) != string(before) {
+		t.Fatal("the configuration file was written for a text/plain body")
+	}
+	if inst.migrations != 0 {
+		t.Fatal("the database was migrated for a text/plain body")
+	}
 }
 
 const validForm = `{"adminEmail":"Admin@Example.com","adminPassword":"correct horse","databaseDriver":"mysql","mysqlHost":"127.0.0.1","mysqlPort":"3306","mysqlDatabase":"ppanel","mysqlUser":"root","mysqlPassword":"secret","redisHost":"127.0.0.1","redisPort":"6379","redisPassword":"r"}`

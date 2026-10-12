@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -122,11 +123,14 @@ func listenPort(port int) int {
 func newConfigServer(w *wizard, opts ...hertzconfig.Option) *server.Hertz {
 	engine := server.Default(opts...)
 	engine.SetHTMLTemplate(template.Must(template.ParseFS(templateFS, "templates/*.html")))
+	// Every route that changes the installation is behind the guard; the
+	// page is served to any request.
+	guard := setupGuard()
 	engine.GET("/init", handleInit)
-	engine.POST("/init/config", w.handleInitConfig)
-	engine.POST("/init/database/test", HandleDatabaseTest)
-	engine.POST("/init/mysql/test", HandleMySQLTest)
-	engine.POST("/init/redis/test", HandleRedisTest)
+	engine.POST("/init/config", guard, w.handleInitConfig)
+	engine.POST("/init/database/test", guard, HandleDatabaseTest)
+	engine.POST("/init/mysql/test", guard, HandleMySQLTest)
+	engine.POST("/init/redis/test", guard, HandleRedisTest)
 	engine.NoRoute(func(_ context.Context, ctx *app.RequestContext) {
 		ctx.Redirect(http.StatusFound, []byte("/init"))
 	})
@@ -135,6 +139,67 @@ func newConfigServer(w *wizard, opts ...hertzconfig.Option) *server.Hertz {
 
 func handleInit(_ context.Context, ctx *app.RequestContext) {
 	ctx.HTML(http.StatusOK, "index.html", nil)
+}
+
+// setupGuard refuses, with 403, a state-changing request that is not the
+// wizard's own page posting. The loopback listener does not stop a page the
+// operator visits during the install from posting to it: a cross-site form
+// can send text/plain, which BindJSON decodes all the same. Each check stands
+// on its own: the Host must name the loopback interface, whatever its port,
+// which also keeps a DNS-rebinding page from being same-origin with it; an
+// Origin, when sent, must be exactly "http://" + Host; and the body must be
+// JSON, which a form cannot send and a cross-origin fetch cannot send without
+// a preflight this server never grants.
+func setupGuard() app.HandlerFunc {
+	return func(_ context.Context, ctx *app.RequestContext) {
+		host := string(ctx.Request.Header.Host())
+		if !isLoopbackHost(host) {
+			reply(ctx, http.StatusForbidden, "Request host is not the installation wizard")
+			return
+		}
+		if origin := ctx.Request.Header.Peek("Origin"); origin != nil && string(origin) != "http://"+host {
+			reply(ctx, http.StatusForbidden, "Request origin is not the installation wizard")
+			return
+		}
+		if !isJSON(ctx) {
+			reply(ctx, http.StatusForbidden, "Request body must be application/json")
+			return
+		}
+	}
+}
+
+// isLoopbackHost reports whether a Host header names the loopback interface:
+// localhost, 127.0.0.1 or ::1 (bracketed in a Host), with or without a port.
+// The port is not checked, because an operator reaches the wizard through an
+// SSH tunnel on a local port of their choice, and a browser omits the default
+// port, so the header can carry no port at all.
+func isLoopbackHost(host string) bool {
+	name, _, err := net.SplitHostPort(host)
+	if err != nil {
+		// No port: the whole value is the host, possibly bracketed.
+		name = host
+	}
+	switch name {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	}
+	return false
+}
+
+// isJSON reports whether the request declares a JSON body. The media type is
+// compared, so parameters such as charset do not matter.
+func isJSON(ctx *app.RequestContext) bool {
+	mediaType, _, err := mime.ParseMediaType(string(ctx.Request.Header.ContentType()))
+	return err == nil && mediaType == "application/json"
+}
+
+// bindJSON decodes a JSON body. BindJSON decodes the body whatever its
+// Content-Type, so the type is checked here as well as by the guard.
+func bindJSON(ctx *app.RequestContext, request any) error {
+	if !isJSON(ctx) {
+		return errors.New("request body must be application/json")
+	}
+	return ctx.BindJSON(request)
 }
 
 // initRequest is the installer's form.
@@ -214,7 +279,7 @@ func reply(ctx *app.RequestContext, status int, msg string) {
 
 func (w *wizard) handleInitConfig(_ context.Context, ctx *app.RequestContext) {
 	var request initRequest
-	if err := ctx.BindJSON(&request); err != nil {
+	if err := bindJSON(ctx, &request); err != nil {
 		reply(ctx, http.StatusBadRequest, "Invalid request")
 		return
 	}
@@ -330,7 +395,7 @@ func HandleDatabaseTest(_ context.Context, ctx *app.RequestContext) {
 		User     string `json:"user"`
 		Password string `json:"password"`
 	}
-	if err := ctx.BindJSON(&request); err != nil {
+	if err := bindJSON(ctx, &request); err != nil {
 		reply(ctx, http.StatusBadRequest, "Invalid request")
 		return
 	}
@@ -451,7 +516,7 @@ func HandleRedisTest(ctx context.Context, requestCtx *app.RequestContext) {
 		Port     string `json:"port"`
 		Password string `json:"password"`
 	}
-	if err := requestCtx.BindJSON(&request); err != nil {
+	if err := bindJSON(requestCtx, &request); err != nil {
 		reply(requestCtx, http.StatusBadRequest, "Invalid request")
 		return
 	}
